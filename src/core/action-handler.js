@@ -1,6 +1,6 @@
 /**
  * Action handling system for Video Speed Controller
- * 
+ *
  */
 
 window.VSC = window.VSC || {};
@@ -19,9 +19,9 @@ class ActionHandler {
    */
   runAction(action, value, e) {
     // Use state manager for complete media discovery (includes shadow DOM)
-    const mediaTags = window.VSC.stateManager ?
-      window.VSC.stateManager.getControlledElements() :
-      []; // No fallback - state manager should always be available
+    const mediaTags = window.VSC.stateManager
+      ? window.VSC.stateManager.getControlledElements()
+      : []; // No fallback - state manager should always be available
 
     // Get the controller that was used if called from a button press event
     let targetController = null;
@@ -280,7 +280,11 @@ class ActionHandler {
    * @param {HTMLMediaElement} video - Video element
    */
   jumpToMark(video) {
-    if (video.vsc.mark == null || typeof video.vsc.mark !== 'number') {
+    if (
+      video.vsc.mark === null ||
+      video.vsc.mark === undefined ||
+      typeof video.vsc.mark !== 'number'
+    ) {
       return;
     }
 
@@ -309,7 +313,10 @@ class ActionHandler {
   flashController(controller, duration) {
     // Don't flash when user has explicitly hidden this controller.
     // vsc-manual + vsc-hidden = "user pressed V to hide" — respect that.
-    if (controller.classList.contains('vsc-manual') && controller.classList.contains('vsc-hidden')) {
+    if (
+      controller.classList.contains('vsc-manual') &&
+      controller.classList.contains('vsc-hidden')
+    ) {
       window.VSC.logger.debug('flashController skipped: user manually hid controller');
       return;
     }
@@ -335,14 +342,11 @@ class ActionHandler {
 
     // For audio controllers, don't set timeout to hide again
     if (!isAudioController) {
-      controller.flashTimer = setTimeout(
-        () => {
-          controller.classList.remove('vsc-show');
-          controller.flashTimer = undefined;
-          window.VSC.logger.debug('Removing vsc-show class after flash timeout');
-        },
-        duration || 2000
-      );
+      controller.flashTimer = setTimeout(() => {
+        controller.classList.remove('vsc-show');
+        controller.flashTimer = undefined;
+        window.VSC.logger.debug('Removing vsc-show class after flash timeout');
+      }, duration || 2000);
     } else {
       window.VSC.logger.debug('Audio controller flash - keeping vsc-show class');
     }
@@ -356,8 +360,9 @@ class ActionHandler {
    */
   isAudioController(controller) {
     // Find associated media element using state manager
-    const mediaElements = window.VSC.stateManager ?
-      window.VSC.stateManager.getControlledElements() : [];
+    const mediaElements = window.VSC.stateManager
+      ? window.VSC.stateManager.getControlledElements()
+      : [];
     for (const media of mediaElements) {
       if (media.vsc && media.vsc.div === controller) {
         return media.tagName === 'AUDIO';
@@ -412,7 +417,9 @@ class ActionHandler {
         targetSpeed = 1.0;
       }
 
-      window.VSC.logger.debug(`Relative speed calculation: currentSpeed=${currentSpeed} + ${value} = ${targetSpeed}`);
+      window.VSC.logger.debug(
+        `Relative speed calculation: currentSpeed=${currentSpeed} + ${value} = ${targetSpeed}`
+      );
     } else {
       // For absolute changes, use value directly
       targetSpeed = value;
@@ -455,17 +462,28 @@ class ActionHandler {
     const speedValue = speed.toFixed(2);
     const numericSpeed = Number(speedValue);
 
-    // 1. Start cooldown FIRST — the playbackRate assignment below triggers a
+    // 1. Update lastSpeed BEFORE touching playbackRate. The playbackRate
+    //    assignment (step 3) fires a synchronous native ratechange event.
+    //    The cooldown handler reads lastSpeed as the "authoritative" speed
+    //    to restore during fight-back. If lastSpeed is stale, the handler
+    //    undoes the very change we're making.
+    //    'init' source: skip — don't arm fight-back with the initialization
+    //    default; let the first real user/site action establish authority.
+    if (source !== 'external' && source !== 'init') {
+      this.config.settings.lastSpeed = numericSpeed;
+    }
+
+    // 2. Start cooldown — the playbackRate assignment below triggers a
     //    native ratechange event synchronously. Without cooldown active,
     //    handleRateChange would misclassify it as an external site change.
     if (this.eventManager) {
       this.eventManager.refreshCoolDown();
     }
 
-    // 2. Set the actual playback rate (native ratechange fires here, blocked by cooldown)
-    video.playbackRate = numericSpeed;
+    // 3. Set the actual playback rate via site handler (native ratechange fires here, blocked by cooldown)
+    window.VSC.siteHandlerManager.handleSpeedChange(video, numericSpeed);
 
-    // 3. Dispatch synthetic event with source tracking
+    // 4. Dispatch synthetic event with source tracking
     video.dispatchEvent(
       new CustomEvent('ratechange', {
         bubbles: true,
@@ -473,12 +491,12 @@ class ActionHandler {
         detail: {
           origin: 'videoSpeed',
           speed: speedValue,
-          source: source
+          source: source,
         },
       })
     );
 
-    // 4. Update UI indicator
+    // 5. Update UI indicator
     const speedIndicator = video.vsc?.speedIndicator;
     if (!speedIndicator) {
       window.VSC.logger.warn(
@@ -488,15 +506,9 @@ class ActionHandler {
     }
     speedIndicator.textContent = numericSpeed.toFixed(2);
 
-    // 5. Update lastSpeed only for user-initiated changes — external/site
-    //    speed overrides must not corrupt the user's intended speed.
-    if (source !== 'external') {
-      this.config.settings.lastSpeed = numericSpeed;
-
-      // 6. Persist to storage only if rememberSpeed is enabled
-      if (this.config.settings.rememberSpeed) {
-        this.config.save({ lastSpeed: numericSpeed });
-      }
+    // 6. Persist to storage only if rememberSpeed is enabled
+    if (source !== 'external' && this.config.settings.rememberSpeed) {
+      this.config.save({ lastSpeed: numericSpeed });
     }
 
     // 7. Flash controller briefly for visual feedback
@@ -504,7 +516,6 @@ class ActionHandler {
       this.flashController(video.vsc.div);
     }
   }
-
 }
 
 // Create singleton instance

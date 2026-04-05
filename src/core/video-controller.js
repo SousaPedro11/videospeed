@@ -1,6 +1,6 @@
 /**
  * Video Controller class for managing individual video elements
- * 
+ *
  */
 
 window.VSC = window.VSC || {};
@@ -52,7 +52,11 @@ class VideoController {
   }
 
   /**
-   * Initialize video speed based on settings
+   * Initialize video speed based on settings.
+   *
+   * Uses source:'init' so setSpeed skips the lastSpeed update — during init
+   * we don't want to arm fight-back with a stale/default value that could
+   * conflict with the player's own initialization sequence.
    * @private
    */
   initializeSpeed() {
@@ -60,28 +64,57 @@ class VideoController {
 
     window.VSC.logger.debug(`Setting initial playbackRate to: ${targetSpeed}`);
 
-    // Use adjustSpeed for initial speed setting to ensure consistency
-    if (this.actionHandler && targetSpeed !== this.video.playbackRate) {
-      window.VSC.logger.debug('Setting initial speed via adjustSpeed');
-      this.actionHandler.adjustSpeed(this.video, targetSpeed, { source: 'internal' });
+    if (!this.actionHandler || targetSpeed === this.video.playbackRate) {
+      return;
+    }
+
+    // Defer until metadata is loaded — setting playbackRate before the player
+    // has initialized can race with the site's own init sequence.
+    if (this.video.readyState < 1) {
+      window.VSC.logger.debug('Deferring initializeSpeed until loadedmetadata');
+      const handler = () => {
+        this.video.removeEventListener('loadedmetadata', handler);
+        if (targetSpeed !== this.video.playbackRate) {
+          this.actionHandler.adjustSpeed(this.video, targetSpeed, { source: 'init' });
+        }
+      };
+      this.video.addEventListener('loadedmetadata', handler);
+    } else {
+      this.actionHandler.adjustSpeed(this.video, targetSpeed, { source: 'init' });
     }
   }
 
   /**
    * Get target speed for video initialization and event restoration.
    *
-   * Always uses in-memory lastSpeed when available — this provides session
-   * persistence (speed survives play/pause/seek events within the same page).
-   * The rememberSpeed setting controls cross-session STORAGE persistence only,
-   * not in-memory behavior.
+   * Speed resolution (see plan.md for full state machine):
+   *   1. baseline = siteDefaultSpeed ?? 1.0   (per-site, replaces hardcoded 1.0)
+   *   2. lastSpeed wins if user has changed it (in-memory, always authoritative)
+   *   3. rememberSpeed only controls cross-session STORAGE persistence
+   *
+   * On fresh page load with rememberSpeed OFF: lastSpeed=1.0 (default) → baseline wins
+   * On fresh page load with rememberSpeed ON:  lastSpeed=stored value → lastSpeed wins
+   * During session after user changes speed:   lastSpeed=user value → lastSpeed wins
    *
    * @returns {number} Target speed
    * @private
    */
   getTargetSpeed() {
-    const targetSpeed = this.config.settings.lastSpeed || 1.0;
-    window.VSC.logger.debug(`Using lastSpeed ${targetSpeed} (rememberSpeed=${this.config.settings.rememberSpeed})`);
-    return targetSpeed;
+    // Layer 1: per-site baseline (replaces the hardcoded 1.0)
+    const baseline = this.config.settings.siteDefaultSpeed ?? 1.0;
+
+    // Layer 2: in-memory lastSpeed — always authoritative when user has changed it.
+    // lastSpeed is updated by setSpeed() on every user action. It reflects the
+    // current session intent regardless of rememberSpeed (which only controls
+    // cross-session STORAGE persistence, not in-memory behavior).
+    const last = this.config.settings.lastSpeed;
+    if (last && last !== 1.0) {
+      window.VSC.logger.debug(`Using lastSpeed ${last} (baseline=${baseline})`);
+      return last;
+    }
+
+    window.VSC.logger.debug(`Using baseline ${baseline} (lastSpeed=${last})`);
+    return baseline;
   }
 
   /**
@@ -208,15 +241,20 @@ class VideoController {
 
     // Bind event handlers
     this.handlePlay = mediaEventAction.bind(this);
-    this.handleSeek = mediaEventAction.bind(this);
+    // Don't restore speed on seeked if the video hasn't loaded data yet —
+    // the player may still be initializing.
+    this.handleSeek = (event) => {
+      if (event.target.readyState < 2) {
+        return;
+      }
+      mediaEventAction.call(this, event);
+    };
 
     // Add essential event listeners for speed restoration
     this.video.addEventListener('play', this.handlePlay);
     this.video.addEventListener('seeked', this.handleSeek);
 
-    window.VSC.logger.debug(
-      'Added essential media event handlers: play, seeked'
-    );
+    window.VSC.logger.debug('Added essential media event handlers: play, seeked');
   }
 
   /**
