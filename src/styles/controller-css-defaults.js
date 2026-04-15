@@ -1,17 +1,13 @@
 /**
  * Default CSS for controller site-specific positioning overrides.
  *
- * Shared by content-entry.js (injects before inject.js for timing safety)
- * and constants.js (exposes on window.VSC.Constants for options page).
+ * Base vsc-controller rule lives in inject.css (manifest-loaded).
+ * This module contains site-specific overrides that layer on top.
  *
- * The BASE vsc-controller rule (position:absolute, visibility, etc.) lives
- * in inject.css — loaded via manifest before any JS runs. This module
- * contains only site-specific overrides that layer on top.
- *
- * Domain-based rules use the --vsc-domain CSS variable set on :root.
- * The variable holds the bare hostname (www. stripped).
- *
- * Pure ES module — no window/DOM dependencies.
+ * Domain selectors use :root[style*='--vsc-domain: "DOMAIN"'] syntax.
+ * At injection time, matching domains get the selector stripped (rule
+ * applies unconditionally); non-matching get [data-vsc-never] (never
+ * matches). No CSS variable is actually set on :root.
  */
 
 export const DEFAULT_CONTROLLER_CSS = `/* === Domain-based rules (stable — hostname only) === */
@@ -39,10 +35,9 @@ export const DEFAULT_CONTROLLER_CSS = `/* === Domain-based rules (stable — hos
   top: 85px;
 }
 
-/* Google Drive */
-:root[style*='--vsc-domain: "drive.google.com"'] vsc-controller {
-  position: relative;
-  top: 10px;
+/* Google Drive — shift native controls overlay down to expose video */
+:root[style*='--vsc-domain: "drive.google.com"'] section[role="tabpanel"][aria-label="Video Player"] {
+  top: 80px;
 }
 
 /* ChatGPT */
@@ -54,19 +49,27 @@ export const DEFAULT_CONTROLLER_CSS = `/* === Domain-based rules (stable — hos
 
 /* === DOM-contextual rules (may break if site changes HTML structure) === */
 
-/* YouTube — shifts controller below info bar when hidden */
-.ytp-hide-info-bar vsc-controller {
+/* YouTube — controller can be inside .html5-video-player (main site via
+   youtube-handler) or a sibling of it (embeds, edge cases). Both selectors
+   needed; :has(> ...) handles the sibling case DOM-order-independently. */
+.ytp-hide-info-bar > vsc-controller,
+:has(> .ytp-hide-info-bar) > vsc-controller {
   position: relative;
   top: 10px;
 }
 
-/* YouTube — shifts below paid promotion overlay when visible */
-.ytp-hide-info-bar:has(.ytp-paid-content-overlay-link:not([style*="display: none"])) vsc-controller {
+/* YouTube — shifts below paid promotion overlay when visible.
+   Domain-wrapped so preprocessDomainCSS strips it on non-YouTube pages:
+   [style*=...] forces global style invalidation on every style mutation,
+   causing multi-second hangs on heavy pages (Gemini, etc). (#1501) */
+:root[style*='--vsc-domain: "youtube.com"'] .ytp-hide-info-bar:has(.ytp-paid-content-overlay-link:not([style*="display: none"])) > vsc-controller,
+:root[style*='--vsc-domain: "youtube.com"'] :has(> .ytp-hide-info-bar .ytp-paid-content-overlay-link:not([style*="display: none"])) > vsc-controller {
   top: 40px;
 }
 
 /* YouTube embedded player (on third-party sites) */
-.html5-video-player:not(.ytp-hide-info-bar) vsc-controller,
+.html5-video-player:not(.ytp-hide-info-bar) > vsc-controller,
+:has(> .html5-video-player:not(.ytp-hide-info-bar)) > vsc-controller,
 #player > vsc-controller {
   position: relative;
   top: 60px;
@@ -80,4 +83,11 @@ export const DEFAULT_CONTROLLER_CSS = `/* === Domain-based rules (stable — hos
 /* Amazon Prime Video — prevent black overlay */
 .dv-player-fullscreen vsc-controller {
   height: 0 !important;
+}
+
+/* Google Drive YouTube embed — no info bar, override embedded player offset.
+   Extra :root bumps specificity above .html5-video-player:not(...) rule. */
+:root:root[style*='--vsc-domain: "youtube.googleapis.com"'] vsc-controller {
+  position: relative;
+  top: 0px;
 }`;
