@@ -393,9 +393,11 @@ describe('VideoController', () => {
 
     const eventManager = new window.VSC.EventManager(config, null);
     const actionHandler = new window.VSC.ActionHandler(config, eventManager);
-    const classifier = eventManager.arbitration.classifier;
+    const arbitration = eventManager.arbitration;
+    const classifier = arbitration.classifier;
     const observeSeek = vi.spyOn(classifier, 'observeSeek');
     const observeMediaInit = vi.spyOn(classifier, 'observeMediaInit');
+    const clearEchoTransaction = vi.spyOn(arbitration, 'clearEchoTransaction');
     const mockVideo = createMockVideo({ readyState: 1 });
     mockDOM.container.appendChild(mockVideo);
 
@@ -425,6 +427,7 @@ describe('VideoController', () => {
     expect(observeSeek).toHaveBeenNthCalledWith(1, mockVideo, 100);
     expect(observeSeek).toHaveBeenNthCalledWith(2, mockVideo, 200);
     expect(observeMediaInit).toHaveBeenCalledWith(mockVideo, 300);
+    expect(clearEchoTransaction).toHaveBeenCalledWith(mockVideo);
 
     controller.remove();
     const seekCallsAfterRemoval = observeSeek.mock.calls.length;

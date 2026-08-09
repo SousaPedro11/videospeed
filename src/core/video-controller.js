@@ -252,6 +252,7 @@ class VideoController {
       mediaEventAction.call(this, event);
     };
     this.handleMediaInit = (event) => {
+      this.arbitration.clearEchoTransaction(this.video);
       this.arbitration.classifier?.observeMediaInit(this.video, event.timeStamp);
     };
 

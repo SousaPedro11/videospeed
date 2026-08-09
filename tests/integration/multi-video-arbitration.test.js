@@ -120,6 +120,21 @@ describe('multi-video speed arbitration', () => {
     controlled.mockRestore();
   });
 
+  it('clears an in-flight echo transaction on a fresh authority epoch', async () => {
+    const { eventManager, actionHandler } = await createWorld();
+    const videoA = controlledVideo(1.5);
+    const videoB = controlledVideo(1.0);
+    const arbitration = eventManager.arbitration;
+    arbitration.observePropagatedEcho(videoA, new Event('ratechange'), {
+      rate: 1.5,
+      epoch: arbitration.authorityEpoch,
+    });
+
+    actionHandler.adjustSpeed(videoB, 1.75);
+
+    expect(arbitration.echoTransactions.size).toBe(0);
+  });
+
   it('uses a same-speed user choice as a fresh authority epoch', async () => {
     const { config, eventManager, actionHandler } = await createWorld();
     const videoA = controlledVideo();
@@ -262,7 +277,7 @@ describe('multi-video speed arbitration', () => {
     });
   });
 
-  it('releases a removed video timer without touching another video state', async () => {
+  it('releases a removed video echo transaction without touching another video state', async () => {
     const { config, eventManager } = await createWorld();
     const videoA = controlledVideo();
     const videoB = controlledVideo();
@@ -270,13 +285,21 @@ describe('multi-video speed arbitration', () => {
 
     siteReset(eventManager, videoA, 100);
     siteReset(eventManager, videoB, 200);
-    const conflictB = eventManager.arbitration.conflicts.get(videoB);
+    const arbitration = eventManager.arbitration;
+    const conflictB = arbitration.conflicts.get(videoB);
+    arbitration.observePropagatedEcho(videoA, new Event('ratechange'), {
+      rate: 2.0,
+      epoch: arbitration.authorityEpoch,
+    });
+    expect(arbitration.echoTransactions.size).toBe(1);
 
-    eventManager.arbitration.release(videoA);
+    arbitration.release(videoA);
 
-    expect(eventManager.arbitration.conflicts.get(videoA)).toBeUndefined();
-    expect(eventManager.arbitration.pendingWrites.get(videoA)).toBeUndefined();
-    expect(eventManager.arbitration.conflicts.get(videoB)).toBe(conflictB);
+    expect(arbitration.conflicts.get(videoA)).toBeUndefined();
+    expect(arbitration.pendingWrites.get(videoA)).toBeUndefined();
+    expect(arbitration.echoTransactions.get(videoA)).toBeUndefined();
+    expect(arbitration.echoTransactions.size).toBe(0);
+    expect(arbitration.conflicts.get(videoB)).toBe(conflictB);
     expect(conflictB.fightCount).toBe(1);
   });
 });

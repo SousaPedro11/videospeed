@@ -400,10 +400,29 @@ class EventManager {
     // masked, so reactive sites that rewrite the rate in response to our
     // writes produce budget-accounted fight exchanges instead of an
     // invisible write war.
-    if (this.arbitration.consumeEcho(video, video.playbackRate)) {
+    const echo = this.arbitration.consumeEcho(video, video.playbackRate);
+    if (echo) {
       window.VSC.logger.debug('Ignoring own write echo (in-flight token consumed)');
-      // Filter the echo only from VSC's decision pipeline. Player listeners
-      // still need the native event to synchronize controls and auxiliary audio.
+      if (echo.suppressPropagation) {
+        // A page listener already proved that observing this exact VSC write
+        // causes it to rewrite the register. Hide only the guarded retry echo
+        // to break that feedback loop; ordinary writes remain observable.
+        event.stopImmediatePropagation();
+      } else {
+        // Filter the echo only from VSC's decision pipeline. A target observer
+        // runs after previously registered page listeners and records only a
+        // direct rewrite caused by this same event.
+        this.arbitration.observePropagatedEcho(video, event, echo);
+      }
+      return;
+    }
+
+    const reactiveRewrite = this.arbitration.consumeEchoReaction(video, event);
+    if (reactiveRewrite === null) {
+      // A page synchronously dispatched another ratechange while handling the
+      // VSC echo. Let the outer event reach its target-tail observer and wait
+      // for the native counter-event before retrying, avoiding reentrant writes.
+      event.stopImmediatePropagation();
       return;
     }
 
@@ -435,19 +454,22 @@ class EventManager {
       return;
     }
 
-    // Everything past the guards above is a genuine external change. The
-    // classifier turns gesture evidence into a verdict; the arbiter decides
-    // accept/enforce/ignore per docs/speed-arbitration.md; the adapter
-    // executes the effects (including fight-back mechanics). No decision
-    // logic lives in this module anymore.
-    const verdict = this.arbitration.classifier.classify({
-      media: video,
-      rate: video.playbackRate,
-      timeStamp: event.timeStamp,
-      readyState: video.readyState,
-      detail: event.detail,
+    // Everything past the guards above is a genuine external change. A proven
+    // echo counter-write is autonomous regardless of stale gesture evidence;
+    // all other changes use the classifier. The arbiter still owns every
+    // accept/enforce/ignore transition and effect.
+    const verdict = reactiveRewrite
+      ? window.VSC.IntentClassifier.VERDICTS.AUTONOMOUS
+      : this.arbitration.classifier.classify({
+          media: video,
+          rate: video.playbackRate,
+          timeStamp: event.timeStamp,
+          readyState: video.readyState,
+          detail: event.detail,
+        });
+    this.arbitration.onExternalRate(video, event, verdict, {
+      suppressRetryEcho: reactiveRewrite,
     });
-    this.arbitration.onExternalRate(video, event, verdict);
   }
 
   /**

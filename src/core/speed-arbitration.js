@@ -37,9 +37,13 @@ class SpeedArbitration {
     this.conflicts = new WeakMap();
     this.timedConflicts = new Set();
 
-    // Native write echoes are also media-local: a token for A must never
-    // absorb B's ratechange.
+    // Native write echoes are media-local: a token for A must never absorb
+    // B's ratechange. One short transaction follows an ordinary echo through
+    // its target listeners and, only when they rewrite A, to the resulting
+    // counter-event. The enumerable Map is bounded by controlled media and is
+    // cleared on authority change, resource change, release, and cleanup.
     this.pendingWrites = new WeakMap();
+    this.echoTransactions = new Map();
 
     // A document-capture terminal event runs before some player handlers.
     // Keep a short, cancellable fallback only for a player that never emits
@@ -50,25 +54,34 @@ class SpeedArbitration {
 
   /**
    * Record an extension-issued register write for the media-local echo filter.
+   * A causally proven feedback-loop retry may hide its echo from page listeners;
+   * ordinary writes remain observable.
    * @param {HTMLMediaElement} video
    * @param {number} rate
+   * @param {{suppressPropagation?: boolean}} [options]
    */
-  noteWrite(video, rate) {
+  noteWrite(video, rate, { suppressPropagation = false } = {}) {
     let queue = this.pendingWrites.get(video);
     if (!queue) {
       queue = [];
       this.pendingWrites.set(video, queue);
     }
-    queue.push({ rate, at: performance.now(), epoch: this.authorityEpoch });
+    queue.push({
+      rate,
+      at: performance.now(),
+      epoch: this.authorityEpoch,
+      suppressPropagation,
+    });
     if (queue.length > SpeedArbitration.ECHO_MAX_PENDING) {
       queue.shift();
     }
   }
 
   /**
+   * Consume a matching extension write token.
    * @param {HTMLMediaElement} video
    * @param {number} rate
-   * @returns {boolean}
+   * @returns {{rate: number, at: number, epoch: number, suppressPropagation: boolean}|false}
    */
   consumeEcho(video, rate) {
     let queue = this.pendingWrites.get(video);
@@ -92,10 +105,121 @@ class SpeedArbitration {
       (write) => Math.abs(write.rate - rate) <= SpeedArbitration.ECHO_TOLERANCE
     );
     if (idx === -1) {
+      // A hidden echo must never linger and suppress a later genuine event if
+      // an earlier page-capture listener rewrote the register before VSC saw it.
+      const visibleWrites = queue.filter((write) => !write.suppressPropagation);
+      if (visibleWrites.length === 0) {
+        this.pendingWrites.delete(video);
+      } else {
+        this.pendingWrites.set(video, visibleWrites);
+      }
       return false;
     }
+    const echo = queue[idx];
     queue.splice(0, idx + 1);
-    return true;
+    return echo;
+  }
+
+  /**
+   * Follow an ordinary VSC echo to the media target, after page listeners that
+   * were registered before this dispatch. If they rewrite the register, retain
+   * one transaction until the browser delivers that setter's counter-event.
+   * @param {HTMLMediaElement} video
+   * @param {Event} event
+   * @param {{rate: number, epoch: number}} echo
+   */
+  observePropagatedEcho(video, event, echo) {
+    this.clearEchoTransaction(video);
+    const transaction = {
+      epoch: echo.epoch,
+      expectedRate: echo.rate,
+      sourceEvent: event,
+      observedRate: null,
+      listener: null,
+    };
+    transaction.listener = (targetEvent) => {
+      if (
+        targetEvent !== transaction.sourceEvent ||
+        this.echoTransactions.get(video) !== transaction
+      ) {
+        return;
+      }
+
+      video.removeEventListener('ratechange', transaction.listener);
+      transaction.listener = null;
+      if (transaction.epoch !== this.authorityEpoch) {
+        this.clearEchoTransaction(video);
+        return;
+      }
+
+      const observedRate = video.playbackRate;
+      if (Math.abs(observedRate - transaction.expectedRate) <= SpeedArbitration.ECHO_TOLERANCE) {
+        this.clearEchoTransaction(video);
+        return;
+      }
+
+      transaction.sourceEvent = null;
+      transaction.observedRate = observedRate;
+    };
+    this.echoTransactions.set(video, transaction);
+    video.addEventListener('ratechange', transaction.listener);
+  }
+
+  /**
+   * @param {HTMLMediaElement} video
+   */
+  clearEchoTransaction(video) {
+    const transaction = this.echoTransactions.get(video);
+    if (!transaction) {
+      return;
+    }
+    if (transaction.listener) {
+      video.removeEventListener('ratechange', transaction.listener);
+    }
+    this.echoTransactions.delete(video);
+  }
+
+  clearAllEchoTransactions() {
+    for (const video of [...this.echoTransactions.keys()]) {
+      this.clearEchoTransaction(video);
+    }
+  }
+
+  /**
+   * Resolve causal evidence before generic classification. A nested synthetic
+   * event is deferred until the outer echo reaches its target tail; a completed
+   * transaction consumes exactly the next same-media external event.
+   * @param {HTMLMediaElement} video
+   * @param {Event} event
+   * @returns {boolean|null} true for a rewrite, null to defer a nested event
+   */
+  consumeEchoReaction(video, event) {
+    const transaction = this.echoTransactions.get(video);
+    if (!transaction) {
+      return false;
+    }
+
+    if (transaction.epoch !== this.authorityEpoch) {
+      this.clearEchoTransaction(video);
+      return false;
+    }
+
+    if (transaction.observedRate === null) {
+      const sourceEventActive =
+        transaction.sourceEvent !== event &&
+        Number.isFinite(transaction.sourceEvent?.eventPhase) &&
+        transaction.sourceEvent.eventPhase !== Event.NONE;
+      if (sourceEventActive) {
+        return null;
+      }
+      this.clearEchoTransaction(video);
+      return false;
+    }
+
+    const rewriteMatches =
+      Math.abs(transaction.observedRate - video.playbackRate) <= SpeedArbitration.ECHO_TOLERANCE;
+    this.clearEchoTransaction(video);
+    return rewriteMatches;
   }
 
   /**
@@ -180,6 +304,7 @@ class SpeedArbitration {
    */
   claimAuthority(speed) {
     this.config.persistAuthority(speed);
+    this.clearAllEchoTransactions();
     this.authorityEpoch += 1;
 
     // Old timers should not keep running after their entire authority epoch
@@ -300,12 +425,18 @@ class SpeedArbitration {
    * @param {HTMLMediaElement} video
    * @param {Event} event
    * @param {string} verdict
+   * @param {{suppressRetryEcho?: boolean}} [options]
    */
-  onExternalRate(video, event, verdict) {
+  onExternalRate(video, event, verdict, { suppressRetryEcho = false } = {}) {
     const A = window.VSC.SpeedArbiter;
     const IC = window.VSC.IntentClassifier;
     const rawRate = video.playbackRate;
     const { state, conflict } = this.stateFor(video);
+    if (suppressRetryEcho) {
+      window.VSC.logger.info(
+        `Detected page rewrite caused by propagated VSC echo: ${state.desired} -> ${rawRate}`
+      );
+    }
 
     // A known temporary hold owns only this media register. Its first normal
     // ratechange is the native release even when weak release click/Space
@@ -390,7 +521,9 @@ class SpeedArbitration {
       window.VSC.logger.info(
         `Fight detection: attempt ${next.fightCount}, site rate ${rawRate} -> re-applying ${state.desired} (input ${inputAge}ms ago)`
       );
-      this.eventManager?.actionHandler?.writeRate(video, state.desired);
+      this.eventManager?.actionHandler?.writeRate(video, state.desired, {
+        suppressEchoPropagation: suppressRetryEcho,
+      });
       event.stopImmediatePropagation();
       return;
     }
@@ -436,6 +569,7 @@ class SpeedArbitration {
       this.conflicts.delete(video);
     }
     this.pendingWrites.delete(video);
+    this.clearEchoTransaction(video);
     this.clearTemporaryReleaseTimer(video);
     this.classifier.releaseMedia(video);
   }
@@ -495,6 +629,7 @@ class SpeedArbitration {
       clearTimeout(entry.timer);
     }
     this.pendingTemporaryReleaseTimers.clear();
+    this.clearAllEchoTransactions();
     this.temporaryReleaseTimers = new WeakMap();
     this.conflicts = new WeakMap();
     this.pendingWrites = new WeakMap();

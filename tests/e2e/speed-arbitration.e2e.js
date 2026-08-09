@@ -220,11 +220,98 @@ export default async function runSpeedArbitrationE2ETests() {
       assert.equal(state.observedRate, 1.25, 'The media listener should observe the VSC write');
     });
 
+    await runTest('a page rewrite caused by an own echo is isolated on the retry', async () => {
+      const reactivePage = await browser.newPage();
+      try {
+        await reactivePage.goto(fixtureUrl, { waitUntil: 'domcontentloaded' });
+        await reactivePage.waitForFunction(
+          () => {
+            const a = document.querySelector('#videoA');
+            const b = document.querySelector('#videoB');
+            return a?.readyState >= 2 && b?.readyState >= 2 && !!a.vsc && !!b.vsc;
+          },
+          { timeout: 15000 }
+        );
+        await reactivePage.evaluate(() => {
+          const video = document.querySelector('#videoA');
+          window.__vscReactiveEchoTrace = [];
+          window.__vscReactiveEchoRewrites = 0;
+          window.__vscReactiveEchoListener = () => {
+            const observedRate = video.playbackRate;
+            window.__vscReactiveEchoTrace.push(observedRate);
+            if (Math.abs(observedRate - 0.75) < 0.001) {
+              window.__vscReactiveEchoRewrites += 1;
+              video.playbackRate = 0.5;
+            }
+          };
+          video.addEventListener('ratechange', window.__vscReactiveEchoListener);
+          const classifier = window.VSC_controller.eventManager.arbitration.classifier;
+          window.__vscReactiveEchoClassify = classifier.classify;
+          classifier.classify = () => window.VSC.IntentClassifier.VERDICTS.USER_INTENT;
+          video.vsc.actionHandler.adjustSpeed(video, 0.75);
+        });
+
+        await reactivePage.waitForFunction(
+          () => {
+            const video = document.querySelector('#videoA');
+            const conflict = window.VSC_controller.eventManager.arbitration.conflicts.get(video);
+            return (
+              window.__vscReactiveEchoRewrites === 1 &&
+              conflict?.fightCount === 1 &&
+              Math.abs(video.playbackRate - 0.75) < 0.001
+            );
+          },
+          { timeout: 5000 }
+        );
+        await sleep(100);
+
+        const state = await reactivePage.evaluate(() => {
+          const video = document.querySelector('#videoA');
+          const otherVideo = document.querySelector('#videoB');
+          const controller = window.VSC_controller;
+          const arbitration = controller.eventManager.arbitration;
+          video.removeEventListener('ratechange', window.__vscReactiveEchoListener);
+          arbitration.classifier.classify = window.__vscReactiveEchoClassify;
+          const result = {
+            rate: video.playbackRate,
+            otherRate: otherVideo.playbackRate,
+            lastSpeed: controller.config.settings.lastSpeed,
+            indicator: video.vsc.speedIndicator.textContent,
+            observedRates: window.__vscReactiveEchoTrace,
+            rewrites: window.__vscReactiveEchoRewrites,
+            mode: arbitration.conflicts.get(video)?.mode,
+          };
+          delete window.__vscReactiveEchoListener;
+          delete window.__vscReactiveEchoClassify;
+          delete window.__vscReactiveEchoTrace;
+          delete window.__vscReactiveEchoRewrites;
+          return result;
+        });
+
+        assert.equal(state.rate, 0.75, 'VSC should retain the explicitly requested rate');
+        assert.equal(state.otherRate, 1.0, 'The reactive rewrite must not touch another media');
+        assert.equal(state.lastSpeed, 0.75, 'The page rewrite must not replace shared authority');
+        assert.equal(state.indicator, '0.75', 'The controller should show the retained rate');
+        assert.equal(
+          state.observedRates.length,
+          1,
+          'The page should observe the initial write but not the guarded retry echo'
+        );
+        assert.equal(state.observedRates[0], 0.75, 'The initial VSC echo should remain observable');
+        assert.equal(state.rewrites, 1, 'One page rewrite should produce only one guarded retry');
+        assert.equal(state.mode, 'HOLDING', 'The media should remain locally enforcing');
+      } finally {
+        await reactivePage.close();
+      }
+    });
+
     await runTest('A can surrender locally while B still enforces shared authority', async () => {
       const state = await page.evaluate(() => {
         const a = document.querySelector('#videoA');
         const b = document.querySelector('#videoB');
         const controller = window.VSC_controller;
+        const arbitration = controller.eventManager.arbitration;
+        const beforeEpoch = arbitration.authorityEpoch;
 
         // Native playbackRate writes queue native ratechange events. Shadow the
         // test media registers so explicit synthetic site events exercise the
@@ -256,7 +343,6 @@ export default async function runSpeedArbitrationE2ETests() {
         }
         siteRate(b, 1.0);
 
-        const arbitration = controller.eventManager.arbitration;
         const conflictA = arbitration.conflicts.get(a);
         const conflictB = arbitration.conflicts.get(b);
         return {
@@ -266,6 +352,7 @@ export default async function runSpeedArbitrationE2ETests() {
           bMode: conflictB?.mode,
           bFightCount: conflictB?.fightCount,
           lastSpeed: controller.config.settings.lastSpeed,
+          beforeEpoch,
           authorityEpoch: arbitration.authorityEpoch,
         };
       });
@@ -279,7 +366,11 @@ export default async function runSpeedArbitrationE2ETests() {
       assert.equal(state.bMode, 'HOLDING', 'B must remain locally enforcing');
       assert.equal(state.bFightCount, 1, 'B should spend only its own first fight');
       assert.equal(state.lastSpeed, 2.0, 'A surrender must not clear shared authority');
-      assert.equal(state.authorityEpoch, 1, 'One VSC command should claim one epoch');
+      assert.equal(
+        state.authorityEpoch,
+        state.beforeEpoch + 1,
+        'One VSC command should claim one epoch'
+      );
     });
 
     await runTest('a same-value VSC action starts a fresh epoch and re-arms A', async () => {

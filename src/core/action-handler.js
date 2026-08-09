@@ -547,11 +547,14 @@ class ActionHandler {
    *
    * @param {HTMLMediaElement} video - Video element
    * @param {number} rate - Target speed
+   * @param {{suppressEchoPropagation?: boolean}} [options]
    */
-  writeRate(video, rate) {
+  writeRate(video, rate, { suppressEchoPropagation = false } = {}) {
     const numericSpeed = Number(rate.toFixed(2));
     if (video.playbackRate !== numericSpeed && this.eventManager?.arbitration) {
-      this.eventManager.arbitration.noteWrite(video, numericSpeed);
+      this.eventManager.arbitration.noteWrite(video, numericSpeed, {
+        suppressPropagation: suppressEchoPropagation,
+      });
     }
     window.VSC.siteHandlerManager.handleSpeedChange(video, numericSpeed);
   }

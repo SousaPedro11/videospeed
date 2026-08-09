@@ -23,16 +23,17 @@ The contract does not prove that a site gesture really meant “set speed.” Th
 | `mode`, `fightCount`, `warQuiet`, `rearmBudget`, temporary override, fight timer | `SpeedArbitration` conflict record | one `HTMLMediaElement`                                   | Local fight/surrender/re-arm state plus native temporary hold overlay               |
 | terminal release fallback timer                                                  | `SpeedArbitration`                 | one `HTMLMediaElement`                                   | Recover from a retired physical hold that never emits a normal release `ratechange` |
 | write-token queue                                                                | `SpeedArbitration.pendingWrites`   | one `HTMLMediaElement`                                   | Filters only that media's expected native echoes                                    |
+| propagated-echo transaction                                                      | `SpeedArbitration`                 | one `HTMLMediaElement`                                   | Links one ordinary VSC echo to a direct target rewrite and its next counter-event   |
 | click/pointer/key and media-side-effect evidence                                 | `IntentClassifier`                 | unresolved document fallback plus resolved media ledgers | Classifies external rate changes; never persists                                    |
 
-The adapter stores conflict records and echo queues in `WeakMap`s. Timers can retain a closure independently of a `WeakMap`, so `VideoController.remove()` must call `SpeedArbitration.release(video)` to clear the timer, record, echo queue, and media gesture ledger.
+The adapter stores conflict records and echo queues in `WeakMap`s. Short-lived echo transactions use an enumerable `Map` so authority changes and teardown can remove target listeners synchronously; the map is bounded to one entry per controlled media and each controller release clears its entry. `VideoController.remove()` must call `SpeedArbitration.release(video)` to clear the timer, record, echo queue, echo transaction, and media gesture ledger.
 
 ## Authority generations
 
 A VSC speed action and an adopted native user choice both claim shared authority:
 
 1. update `lastSpeed` and persist it only when `rememberSpeed` is enabled;
-2. advance `authorityEpoch` and cancel all prior-epoch fight timers;
+2. advance `authorityEpoch` and cancel all prior-epoch fight timers and echo transactions;
 3. reset the acting media into local `HOLDING` state;
 4. lazily replace every other media's stale local record with fresh `HOLDING` state when it is next observed or receives lifecycle handling.
 
@@ -69,7 +70,21 @@ A bulk VSC command must claim one generation, not one generation per loop iterat
 | `PERSIST(v)` | Claim shared in-memory authority and schedule a storage write only when `rememberSpeed` is enabled |
 | `SYNC_UI(v)` | Update only the affected controller's speed badge                                                  |
 
-Echo queues are per media and tagged with the authority generation that wrote them. `consumeEcho()` discards an older-generation token before matching, so a real site reset that reuses an old rate after a fresh user choice reaches arbitration instead of being swallowed as an echo. Consuming an echo filters it only from VSC's decision pipeline; the native event still propagates so player controls and auxiliary media can synchronize with the write.
+Echo queues are per media and tagged with the authority generation that wrote them. `consumeEcho()` discards an older-generation token before matching, so a real site reset that reuses an old rate after a fresh user choice reaches arbitration instead of being swallowed as an echo. Consuming an ordinary echo filters it only from VSC's decision pipeline; the native event still propagates so player controls and auxiliary media can synchronize with the write.
+
+During document capture, VSC starts one media-local transaction for each ordinary echo and appends a listener at the media target. That listener runs after target listeners registered before the dispatch. If they leave the register unchanged, the transaction ends. If they rewrite it, the transaction records the resulting rate and consumes exactly the next non-token `ratechange` for that media; matching media, authority generation, and observed counter-rate are required. A mismatch clears the transaction and follows ordinary classification. No wall-clock window establishes causality.
+
+A nested synthetic `ratechange` while the source echo is still propagating is stopped and deferred until the target listener completes the observation. If propagation is stopped before that listener, VSC has no proof and conservatively clears the transaction on the next event. Page capture listeners that run before VSC and target listeners that stop later target listeners are outside this proof boundary.
+
+### VSC write authority
+
+An explicit VSC speed command owns the immediate `playbackRate` transaction. Its initial native echo remains visible so player controls, auxiliary media, and passive integrations can observe it. If a player synchronously rewrites the same media register in response and VSC can causally associate the rewrite, that value is player policy—not a new user choice—and cannot replace shared authority or be persisted. It enters the bounded autonomous-fight path; only the corrective retry echo is hidden to prevent another veto.
+
+Authority ends with that transaction; VSC does not own the register permanently or fight without limit. Later native choices, asynchronous resets, unrelated media, new authority generations, and subsequent VSC commands use normal classification, propagation, and arbitration.
+
+This deliberately favors VSC's granular rate over players that enforce restricted rates through change-event reactions. Because DOM propagation cannot suppress one listener, the corrective echo is hidden from all downstream page listeners; player UI or internal state may therefore retain the rejected rate. Causal proof excludes earlier document-capture listeners, listeners that block target observation, listeners installed after VSC's observer during the dispatch, and asynchronous rewrites. Since `ratechange` identifies neither writer nor assigned value, a genuine native choice matching the recorded counter-rate before its queued event arrives can receive one correction; re-selection is preferred to allowing a proven veto to replace VSC authority.
+
+The policy is automatic. Add a compatibility mode only for a concrete conflict outside this rule. Reactive-echo isolation is browser-adapter policy, not a pure-arbiter or TLA+ transition.
 
 There is intentionally no document-wide surrender effect. Local surrender is not an authority mutation.
 
@@ -104,7 +119,7 @@ The timer is cleared when a local war reaches `REARMABLE` or `SUPPRESSED`; other
 3. **Per-media non-interference and bounded fighting:** one autonomous event causes at most one write and can mutate only its own conflict record; each media spends only its own `MAX_FIGHT` budget.
 4. **Local surrender:** a `REARMABLE` or `SUPPRESSED` record preserves shared authority and leaves every other record usable.
 5. **Fresh-choice recovery:** one VSC/native choice invalidates stale local suppression and lets the next lifecycle event retry that media.
-6. **Teardown safety:** no timer, echo, deferred metadata callback, or classifier evidence may survive a controller's removal.
+6. **Teardown safety:** no timer, echo transaction, deferred metadata callback, or classifier evidence may survive a controller's removal.
 7. **Temporary-override locality:** a temporary native hold can mutate only its media register and overlay; it cannot change `lastSpeed`, storage, the authority epoch, fight state, or another media's UI/register.
 8. **Gesture isolation:** confidently attributed A evidence must never bless B. Unresolved evidence may use the documented fallback, but it is never combined into a synthetic A/B sequence.
 
@@ -136,7 +151,7 @@ Per-site signature activation is declared by site handlers (`BaseSiteHandler.get
 
 [`specs/SpeedArbiter.tla`](../specs/SpeedArbiter.tla) models two videos (`A`, `B`), two symbolic speeds, a one-fight local budget, independent session authority and persisted storage, both `rememberSpeed` settings, local phase/budget/pending state, temporary native overrides, native adoption, local surrender/re-arm, lifecycle locality, and release. This includes the site-rule shape where in-memory authority differs from stored speed. The wrapper fixes TLC's fingerprint polynomial, so the bounded model's reported state count is reproducible for a given TLC version and configuration.
 
-The TLA+ model is intentionally an abstraction, not an executable browser simulator. It eagerly resets conflict records on an authority claim instead of retaining stale epoch-tagged `WeakMap` entries; this is observationally equivalent to lazy reset. Temporary overrides are deliberately separate from those conflict records, so an authority choice on B cannot erase A's active native hold before release restores the latest shared target. The model represents the known 2x boost and its release directly, while JS tests cover gesture attribution, capture-loss inertness, terminal-release fallback, long-press click suppression, Space key lifecycle, strong native-intent precedence, media-side-effect demotion, epoch-tagged echo-token queues, browser event coalescing, and deferred metadata DOM listener wiring. Init-noise convergence is likewise outside the model's safety assertions because the production adapter deliberately waits for lifecycle handling.
+The TLA+ model is intentionally an abstraction, not an executable browser simulator. It eagerly resets conflict records on an authority claim instead of retaining stale epoch-tagged `WeakMap` entries; this is observationally equivalent to lazy reset. Temporary overrides are deliberately separate from those conflict records, so an authority choice on B cannot erase A's active native hold before release restores the latest shared target. The model represents the known 2x boost and its release directly, while JS tests cover gesture attribution, capture-loss inertness, terminal-release fallback, long-press click suppression, Space key lifecycle, strong native-intent precedence, media-side-effect demotion, epoch-tagged echo-token queues, reactive echo isolation, browser event coalescing, and deferred metadata DOM listener wiring. Reactive echo isolation is an adapter-level propagation policy around the existing `WRITE` effect, so it does not change the modeled state machine. Init-noise convergence is likewise outside the model's safety assertions because the production adapter deliberately waits for lifecycle handling.
 
 Run TLC with the reproducible wrapper:
 
@@ -150,22 +165,22 @@ CI installs Temurin Java 17, caches the verified JAR, and runs `npm run test:tlc
 
 ## Verification map
 
-| Layer                    | What it checks                                                                                                             | Command                                                                                                                                                       |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pure core tests          | Local phase/effect transitions and bounded mini-model invariants                                                           | `npx vitest run tests/unit/core/arbiter.test.js`                                                                                                              |
-| Differential replay      | Production pipeline versus pure local arbiter for single-media traces, including side-effect reset persistence             | `npx vitest run tests/integration/arbiter-differential.test.js`                                                                                               |
-| Multi-video integration  | Independent budgets, local surrender/re-arm, temporary-override locality, authority epoch, bulk batching, release          | `npx vitest run tests/integration/multi-video-arbitration.test.js`                                                                                            |
-| Gesture/refinement tests | Scoped click ledgers, side-effect demotion, temporary hold/release, terminal fallback, focus safety, and resolver behavior | `npx vitest run tests/unit/core/intent-classifier.test.js tests/unit/utils/event-manager.test.js tests/unit/site-handlers/youtube-gesture-resolution.test.js` |
-| Timing geometry          | Constant orderings against measured anchors (YouTube 500ms engagement, click-press durations)                              | `npx vitest run tests/unit/core/timing-constants.test.js`                                                                                                     |
-| TLA+ model               | Shared authority plus two local conflict registers, temporary-override locality, and autonomous non-interference           | `npm run test:tlc`                                                                                                                                            |
-| Browser arbitration E2E  | Real media event ordering, trusted click sequences, persistence, local surrender/re-arm, and deferred removal              | `npm run build && node tests/e2e/run-e2e.js arbitration`                                                                                                      |
-| Full repository check    | Lint, unit/integration tests, and release build                                                                            | `npm run lint && npm test && npm run build:release`                                                                                                           |
+| Layer                    | What it checks                                                                                                                         | Command                                                                                                                                                       |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pure core tests          | Local phase/effect transitions and bounded mini-model invariants                                                                       | `npx vitest run tests/unit/core/arbiter.test.js`                                                                                                              |
+| Differential replay      | Production pipeline versus pure local arbiter for single-media traces, including side-effect reset persistence                         | `npx vitest run tests/integration/arbiter-differential.test.js`                                                                                               |
+| Multi-video integration  | Independent budgets, local surrender/re-arm, temporary-override locality, authority epoch, bulk batching, release                      | `npx vitest run tests/integration/multi-video-arbitration.test.js`                                                                                            |
+| Gesture/refinement tests | Scoped click ledgers, side-effect demotion, temporary hold/release, terminal fallback, focus safety, and resolver behavior             | `npx vitest run tests/unit/core/intent-classifier.test.js tests/unit/utils/event-manager.test.js tests/unit/site-handlers/youtube-gesture-resolution.test.js` |
+| Timing geometry          | Constant orderings against measured anchors (YouTube 500ms engagement, click-press durations)                                          | `npx vitest run tests/unit/core/timing-constants.test.js`                                                                                                     |
+| TLA+ model               | Shared authority plus two local conflict registers, temporary-override locality, and autonomous non-interference                       | `npm run test:tlc`                                                                                                                                            |
+| Browser arbitration E2E  | Real media event ordering, reactive echo isolation, trusted click sequences, persistence, local surrender/re-arm, and deferred removal | `npm run build && node tests/e2e/run-e2e.js arbitration`                                                                                                      |
+| Full repository check    | Lint, unit/integration tests, and release build                                                                                        | `npm run lint && npm test && npm run build:release`                                                                                                           |
 
 ## Change checklist
 
 1. State whether the change belongs to shared authority, a per-media conflict record, the classifier, or a site resolver.
 2. Keep MAIN-world code free of `chrome.*` and keep bridge code free of page DOM access.
-3. Add or update a pure transition test before adding DOM-specific branching.
+3. Add or update a pure transition test when arbiter semantics change; keep adapter-only DOM behavior out of the pure core.
 4. Add a multi-video regression whenever a change can affect ownership, local timers, local suppression, or bulk actions.
 5. Update the TLA+ model only for pure shared/local arbitration semantics; test DOM attribution separately.
 6. Run lint, the affected Vitest suites, `npm run test:tlc`, and the full verification set before merging.

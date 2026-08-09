@@ -25,6 +25,49 @@ function fightCount(arbitration, video) {
   return arbitration.conflicts.get(video)?.fightCount ?? 0;
 }
 
+async function createRealRateWorld(rate = 0.75) {
+  const config = window.VSC.videoSpeedConfig;
+  await config.load();
+  config.settings.lastSpeed = rate;
+
+  const eventManager = new window.VSC.EventManager(config, null);
+  const actionHandler = new window.VSC.ActionHandler(config, eventManager);
+  eventManager.actionHandler = actionHandler;
+  eventManager.setupRateChangeListener(document);
+
+  const video = document.createElement('video');
+  let playbackRate = rate;
+  Object.defineProperty(video, 'playbackRate', {
+    configurable: true,
+    get: () => playbackRate,
+    set: (value) => {
+      playbackRate = Number(value);
+    },
+  });
+  video.vsc = {
+    div: document.createElement('div'),
+    speedIndicator: { textContent: rate.toFixed(2) },
+  };
+  Object.defineProperty(video, 'readyState', { value: 4, configurable: true });
+  document.body.append(video);
+
+  return {
+    config,
+    eventManager,
+    video,
+    cleanup() {
+      eventManager.cleanup();
+      video.remove();
+    },
+  };
+}
+
+function dispatchRateChange(video) {
+  const event = new Event('ratechange', { composed: true });
+  video.dispatchEvent(event);
+  return event;
+}
+
 describe('EventManager', () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -68,6 +111,133 @@ describe('EventManager', () => {
     expect(fightCount(eventManager.arbitration, mockVideo)).toBe(0);
   });
 
+  it('lets the initial echo propagate and isolates only its reactive retry', async () => {
+    const world = await createRealRateWorld();
+    const { config, eventManager, video } = world;
+    const observedRates = [];
+    let shouldRewrite = true;
+    video.addEventListener('ratechange', () => {
+      observedRates.push(video.playbackRate);
+      if (shouldRewrite) {
+        shouldRewrite = false;
+        video.playbackRate = 0.5;
+      }
+    });
+    const classify = vi
+      .spyOn(eventManager.arbitration.classifier, 'classify')
+      .mockReturnValue(window.VSC.IntentClassifier.VERDICTS.USER_INTENT);
+
+    try {
+      eventManager.arbitration.noteWrite(video, 0.75);
+      dispatchRateChange(video);
+
+      expect(eventManager.arbitration.echoTransactions.get(video)).toMatchObject({
+        expectedRate: 0.75,
+        observedRate: 0.5,
+      });
+
+      // Counter-event correlation is ordered by the media event stream, not a
+      // wall-clock heuristic, so background-style delay cannot expire it.
+      vi.advanceTimersByTime(5000);
+      dispatchRateChange(video);
+      expect(video.playbackRate).toBe(0.75);
+      expect(eventManager.arbitration.echoTransactions.get(video)).toBeUndefined();
+
+      dispatchRateChange(video);
+
+      expect(observedRates).toEqual([0.75]);
+      expect(classify).not.toHaveBeenCalled();
+      expect(config.settings.lastSpeed).toBe(0.75);
+      expect(fightCount(eventManager.arbitration, video)).toBe(1);
+    } finally {
+      world.cleanup();
+    }
+  });
+
+  it('defers a nested synthetic counter-event until the native media event', async () => {
+    const world = await createRealRateWorld();
+    const { eventManager, video } = world;
+    const observedRates = [];
+    let dispatchedNested = false;
+    video.addEventListener('ratechange', () => {
+      observedRates.push(video.playbackRate);
+      if (!dispatchedNested) {
+        dispatchedNested = true;
+        video.playbackRate = 0.5;
+        dispatchRateChange(video);
+      }
+    });
+
+    try {
+      eventManager.arbitration.noteWrite(video, 0.75);
+      dispatchRateChange(video);
+
+      expect(observedRates).toEqual([0.75]);
+      expect(eventManager.arbitration.echoTransactions.get(video)).toMatchObject({
+        observedRate: 0.5,
+      });
+
+      dispatchRateChange(video);
+      dispatchRateChange(video);
+
+      expect(video.playbackRate).toBe(0.75);
+      expect(observedRates).toEqual([0.75]);
+      expect(fightCount(eventManager.arbitration, video)).toBe(1);
+    } finally {
+      world.cleanup();
+    }
+  });
+
+  it('clears a mismatched counter-event before ordinary classification', async () => {
+    const world = await createRealRateWorld();
+    const { config, eventManager, video } = world;
+    let shouldRewrite = true;
+    video.addEventListener('ratechange', () => {
+      if (shouldRewrite) {
+        shouldRewrite = false;
+        video.playbackRate = 0.5;
+      }
+    });
+    vi.spyOn(eventManager.arbitration.classifier, 'classify').mockReturnValue(
+      window.VSC.IntentClassifier.VERDICTS.USER_INTENT
+    );
+
+    try {
+      eventManager.arbitration.noteWrite(video, 0.75);
+      dispatchRateChange(video);
+      video.playbackRate = 1.5;
+      dispatchRateChange(video);
+
+      expect(config.settings.lastSpeed).toBe(1.5);
+      expect(eventManager.arbitration.echoTransactions.get(video)).toBeUndefined();
+      expect(fightCount(eventManager.arbitration, video)).toBe(0);
+    } finally {
+      world.cleanup();
+    }
+  });
+
+  it('keeps a normal fight-back echo observable without a reactive rewrite', async () => {
+    const world = await createRealRateWorld();
+    const { eventManager, video } = world;
+    const observedRates = [];
+    video.addEventListener('ratechange', () => observedRates.push(video.playbackRate));
+
+    try {
+      eventManager.arbitration.noteWrite(video, 0.75);
+      dispatchRateChange(video);
+      expect(eventManager.arbitration.echoTransactions.get(video)).toBeUndefined();
+
+      video.playbackRate = 0.5;
+      dispatchRateChange(video);
+      dispatchRateChange(video);
+
+      expect(video.playbackRate).toBe(0.75);
+      expect(observedRates).toEqual([0.75, 0.75]);
+    } finally {
+      world.cleanup();
+    }
+  });
+
   it('tokens are consume-once: a second identical rate is treated as external', async () => {
     const config = window.VSC.videoSpeedConfig;
     await config.load();
@@ -81,9 +251,24 @@ describe('EventManager', () => {
     Object.defineProperty(mockVideo, 'readyState', { value: 4, configurable: true });
 
     eventManager.arbitration.noteWrite(mockVideo, 2.0);
-    expect(eventManager.arbitration.consumeEcho(mockVideo, 2.0)).toBe(true);
+    expect(eventManager.arbitration.consumeEcho(mockVideo, 2.0)).toMatchObject({
+      rate: 2.0,
+      suppressPropagation: false,
+    });
     // Same value again — token is gone, this is a genuine external event.
     expect(eventManager.arbitration.consumeEcho(mockVideo, 2.0)).toBe(false);
+  });
+
+  it('drops an unmatched hidden-echo token before it can suppress a later event', async () => {
+    const config = window.VSC.videoSpeedConfig;
+    await config.load();
+    const eventManager = new window.VSC.EventManager(config, null);
+    const video = createMockVideo({ playbackRate: 0.75 });
+
+    eventManager.arbitration.noteWrite(video, 0.75, { suppressPropagation: true });
+
+    expect(eventManager.arbitration.consumeEcho(video, 0.5)).toBe(false);
+    expect(eventManager.arbitration.consumeEcho(video, 0.75)).toBe(false);
   });
 
   it('echo matching is value-tolerant for player-quantized echoes', async () => {
@@ -96,7 +281,7 @@ describe('EventManager', () => {
 
     // One 2-decimal rounding step off — a player quantized our write.
     eventManager.arbitration.noteWrite(mockVideo, 2.0);
-    expect(eventManager.arbitration.consumeEcho(mockVideo, 2.01)).toBe(true);
+    expect(eventManager.arbitration.consumeEcho(mockVideo, 2.01)).toBeTruthy();
 
     eventManager.arbitration.noteWrite(mockVideo, 2.0);
     expect(eventManager.arbitration.consumeEcho(mockVideo, 2.1)).toBe(false);
@@ -115,7 +300,7 @@ describe('EventManager', () => {
     eventManager.arbitration.noteWrite(mockVideo, 1.2);
     eventManager.arbitration.noteWrite(mockVideo, 1.3);
 
-    expect(eventManager.arbitration.consumeEcho(mockVideo, 1.3)).toBe(true);
+    expect(eventManager.arbitration.consumeEcho(mockVideo, 1.3)).toBeTruthy();
     // The earlier writes' echoes were coalesced — their tokens are retired.
     expect(eventManager.arbitration.consumeEcho(mockVideo, 1.1)).toBe(false);
     expect(eventManager.arbitration.consumeEcho(mockVideo, 1.2)).toBe(false);
