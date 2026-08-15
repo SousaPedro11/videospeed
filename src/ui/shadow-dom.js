@@ -29,33 +29,29 @@ class ShadowDOMManager {
         display: inline-block;
       }
       
-      /* Hide shadow DOM content for different hiding scenarios */
-      :host(.vsc-hidden) #controller,
-      :host(.vsc-nosource) #controller {
+      /* Hide the automatic layer without disturbing any explicit override. */
+      :host(.vsc-hidden) #controller {
         display: none !important;
         visibility: hidden !important;
         opacity: 0 !important;
       }
 
-      /* YouTube autohide — fade with player controls */
-      :host(.vsc-autohide) #controller {
-        visibility: hidden !important;
-        opacity: 0 !important;
-        transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-      }
-
-      /* Override hiding for manual controllers (unless explicitly hidden) */
-      :host(.vsc-manual:not(.vsc-hidden)) #controller {
-        display: block !important;
-        visibility: visible !important;
-        opacity: ${opacity} !important;
-      }
-
-      /* Show shadow DOM content when host has vsc-show class (highest priority) */
+      /* Explicit show and temporary speed feedback outrank automatic hiding,
+         including startHidden, media visibility, and site autohide. */
+      :host([data-vsc-visibility="show"]) #controller,
       :host(.vsc-show) #controller {
         display: block !important;
         visibility: visible !important;
         opacity: ${opacity} !important;
+      }
+
+      /* Explicit hide and unavailable media are final: flashes and user show
+         overrides must not reveal them. */
+      :host([data-vsc-visibility="hide"]) #controller,
+      :host(.vsc-nosource) #controller {
+        display: none !important;
+        visibility: hidden !important;
+        opacity: 0 !important;
       }
       
       #controller {
@@ -146,12 +142,6 @@ class ShadowDOMManager {
       button.rw {
         opacity: 0.65;
       }
-      
-      button.hideButton {
-        opacity: 0.65;
-        margin-left: 8px;
-        margin-right: 2px;
-      }
     `;
     shadow.appendChild(style);
 
@@ -179,7 +169,6 @@ class ShadowDOMManager {
       { action: 'slower', text: '−', class: '' },
       { action: 'faster', text: '+', class: '' },
       { action: 'advance', text: '»', class: 'rw' },
-      { action: 'display', text: '×', class: 'hideButton' },
     ];
 
     buttons.forEach((btnConfig) => {

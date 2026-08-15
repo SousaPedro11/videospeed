@@ -9,7 +9,20 @@ import '../utils/constants.js';
 import '../utils/logger.js';
 import '../utils/debug-helper.js';
 import '../utils/dom-utils.js';
+
+// Speed arbitration: pure decision core + intent classifier + adapter.
+// Must precede event-manager.js and video-controller.js, which construct
+// the adapter. See docs/speed-arbitration.md.
+import '../core/arbiter.js';
+import '../core/intent-classifier.js';
+import '../core/speed-arbitration.js';
+import '../core/controller-visibility.js';
+
 import '../utils/event-manager.js';
+
+// Site pattern matching — side-effect import registers window.VSC.matchSiteRule.
+// Must come before settings.js so load() can call it.
+import '../utils/site-pattern.js';
 
 // Storage and settings - depends on utils
 import '../core/storage-manager.js';
@@ -39,6 +52,8 @@ import '../site-handlers/youtube-handler.js';
 import '../site-handlers/facebook-handler.js';
 import '../site-handlers/amazon-handler.js';
 import '../site-handlers/apple-handler.js';
+import '../site-handlers/dailymotion-handler.js';
+import '../site-handlers/frame-handler.js';
 import '../site-handlers/index.js';
 
 // Netflix-specific script

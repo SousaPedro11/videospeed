@@ -7,10 +7,14 @@ window.VSC = window.VSC || {};
 class YouTubeHandler extends window.VSC.BaseSiteHandler {
   /**
    * Check if this handler applies to YouTube
+   * @param {string} [hostname] - Injectable for tests; defaults to live location
    * @returns {boolean} True if on YouTube
    */
-  static matches() {
-    return location.hostname === 'www.youtube.com';
+  static matches(hostname = location.hostname) {
+    // youtube-nocookie.com is the privacy-enhanced embed host: identical
+    // player build, DOM, and control layers. music.youtube.com stays
+    // excluded — different player shell.
+    return hostname === 'www.youtube.com' || hostname === 'www.youtube-nocookie.com';
   }
 
   /**
@@ -24,16 +28,45 @@ class YouTubeHandler extends window.VSC.BaseSiteHandler {
     // Default: insert into the .html5-video-player (one level up from video container).
     let targetParent = parent.parentElement;
 
-    // Embedded YouTube has a #player-controls overlay that sits as a sibling of
-    // .html5-video-player and creates a separate stacking context, intercepting
-    // all pointer events. Our controller inside .html5-video-player can't z-index
-    // above it. Fix: insert into #player (the common parent) so our controller
-    // participates in the same stacking context as the overlay.
-    if (document.getElementById('player-controls')) {
-      const playerContainer = targetParent.parentElement;
-      if (playerContainer) {
-        targetParent = playerContainer;
-      }
+    // 2026 embed layout: YouTube moved the #player-controls overlay out of
+    // #player to a position:fixed <body> child (ytm-* control host). Nothing
+    // inserted inside #player can stack above it — #movie_player is a
+    // z-index:0 stacking context painted before that fixed sibling — so the
+    // controller must anchor at body level, where its own z-index competes in
+    // the root stacking context. This also removes #movie_player from the
+    // host's ancestry, so the light-DOM .ytp-autohide descendant rule stops
+    // matching. This matters because the ytm UI sets that class once and never
+    // toggles it.
+    // Trade-off: while the player element itself is fullscreened, a
+    // body-level controller does not render; keyboard shortcuts still work.
+    // Scoped to /embed/ so a desktop page's global #player-controls can never
+    // re-trigger the historical Polymer-crash insertion.
+    if (
+      location.pathname.startsWith('/embed/') &&
+      document.body?.querySelector(':scope > #player-controls')
+    ) {
+      return {
+        insertionPoint: document.body,
+        insertionMethod: 'firstChild',
+        targetParent: document.body,
+      };
+    }
+
+    // Older embed layout: #player-controls overlay sits as a sibling of
+    // .html5-video-player inside #player and creates a separate stacking
+    // context, intercepting all pointer events. Our controller inside
+    // .html5-video-player can't z-index above it. Fix: insert into #player
+    // (the common parent) so our controller participates in the same stacking
+    // context as the overlay.
+    // NOTE: Must scope the query to targetParent.parentElement to avoid falsely matching
+    // a global #player-controls element on the desktop site, which promotes insertion
+    // into the tightly-managed ytd-player > div#container and crashes Polymer.
+    if (
+      targetParent &&
+      targetParent.parentElement &&
+      targetParent.parentElement.querySelector('#player-controls')
+    ) {
+      targetParent = targetParent.parentElement;
     }
 
     return {
@@ -43,87 +76,74 @@ class YouTubeHandler extends window.VSC.BaseSiteHandler {
     };
   }
 
-  /**
-   * Initialize YouTube-specific functionality
-   * @param {Document} document - Document object
-   */
-  initialize(document) {
-    super.initialize(document);
+  // YouTube autohide is handled by domain-scoped light-DOM CSS in
+  // controller-css-defaults.js. The descendant selector reacts to YouTube's
+  // page-owned class without forwarding state through a MutationObserver.
 
-    // Set up YouTube-specific CSS handling
-    this.setupYouTubeCSS();
+  /**
+   * Press-and-hold 2x boost (#1554/#1568): the pointer variant fires a
+   * ratechange while the pointer is still down, before any click event
+   * exists (PR #1555). The SPACEBAR variant of the same boost armed via
+   * legacy any-key-arming — narrowed away by TARGET_RULES — so Space must
+   * arm here explicitly (held Space auto-repeats keydown, keeping the
+   * gesture window fresh through the hold and across the release reset).
+   * Scoped to this handler's matches() hosts: www.youtube.com and the
+   * privacy-enhanced embed host, which serve the identical player.
+   * (#1581 needs no entry: click-seek resets go to 1.0, and a 1.0 adoption
+   * requires STRONG evidence under the classifier's tiered rules.)
+   * @returns {Object} Classifier rule activations for YouTube
+   */
+  getClassifierRules() {
+    return YouTubeHandler.CLASSIFIER_RULES;
   }
 
   /**
-   * Set up YouTube-specific CSS and autohide class forwarding.
-   * Watches for YouTube's .ytp-autohide class on the player element
-   * and forwards it as vsc-autohide on all vsc-controller elements
-   * within that player, so the shadow DOM CSS can handle visibility.
-   * @private
+   * Associate a gesture in YouTube player chrome with exactly one controlled
+   * video. Player controls are overlays/siblings rather than video children,
+   * so EventManager's direct composed-path resolution cannot see them.
+   *
+   * This deliberately recognizes the whole player chrome, including seek
+   * controls: it only prevents a click for player A from blessing player B;
+   * it does not claim to distinguish a seek from a native speed-menu action.
+   * @param {Event} event
+   * @param {HTMLMediaElement[]} mediaElements
+   * @returns {HTMLMediaElement|null}
    */
-  setupYouTubeCSS() {
-    this.setupAutohideForwarding();
-    window.VSC.logger.debug('YouTube CSS setup completed');
+  resolveGestureMedia(event, mediaElements) {
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+    const matches = mediaElements.filter((video) => this.gestureBelongsToVideo(path, video));
+    return matches.length === 1 ? matches[0] : null;
   }
 
   /**
-   * Observe .html5-video-player for ytp-autohide class changes
-   * and forward as vsc-autohide to controllers within the player.
+   * @param {EventTarget[]} path
+   * @param {HTMLMediaElement} video
+   * @returns {boolean}
    * @private
    */
-  setupAutohideForwarding() {
-    // Find the YouTube player element
-    const player = document.querySelector('.html5-video-player');
+  gestureBelongsToVideo(path, video) {
+    const player =
+      video.closest?.('.html5-video-player') ||
+      video.closest?.('#movie_player') ||
+      video.closest?.('.ytp-player-content');
     if (!player) {
-      window.VSC.logger.debug('YouTube player element not found, will retry on mutation');
-      // Retry when player appears in DOM
-      const bodyObserver = new MutationObserver(() => {
-        const p = document.querySelector('.html5-video-player');
-        if (p) {
-          bodyObserver.disconnect();
-          this.observePlayerAutohide(p);
-        }
-      });
-      bodyObserver.observe(document.body, { childList: true, subtree: true });
-      this.autohideBodyObserver = bodyObserver;
-      return;
+      return false;
     }
 
-    this.observePlayerAutohide(player);
-  }
+    const includes = (container) =>
+      !!container &&
+      path.some((node) => node === container || (node?.nodeType && container.contains(node)));
+    if (includes(player)) {
+      return true;
+    }
 
-  /**
-   * Set up MutationObserver on the player element for autohide forwarding.
-   * @param {HTMLElement} player - The .html5-video-player element
-   * @private
-   */
-  observePlayerAutohide(player) {
-    const syncAutohide = () => {
-      const hasAutohide = player.classList.contains('ytp-autohide');
-      const controllers = player.querySelectorAll('vsc-controller');
-      controllers.forEach((controller) => {
-        if (hasAutohide) {
-          controller.classList.add('vsc-autohide');
-        } else {
-          controller.classList.remove('vsc-autohide');
-        }
-      });
-    };
-
-    // Sync initial state
-    syncAutohide();
-
-    this.autohideObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.attributeName === 'class') {
-          syncAutohide();
-          break;
-        }
-      }
-    });
-
-    this.autohideObserver.observe(player, { attributes: true, attributeFilter: ['class'] });
-    window.VSC.logger.debug('YouTube autohide forwarding observer set up');
+    // Embedded players place #player-controls alongside the player in the
+    // common parent stacking context. Scope it to that parent so a desktop
+    // page's unrelated global ID cannot claim this video.
+    const embeddedControls = Array.from(player.parentElement?.children || []).find(
+      (child) => child.id === 'player-controls'
+    );
+    return includes(embeddedControls);
   }
 
   /**
@@ -165,7 +185,7 @@ class YouTubeHandler extends window.VSC.BaseSiteHandler {
             const iframeVideos = iframeDoc.querySelectorAll('video');
             videos.push(...Array.from(iframeVideos));
           }
-        } catch (e) {
+        } catch {
           // Cross-origin iframe, ignore
         }
       });
@@ -175,17 +195,9 @@ class YouTubeHandler extends window.VSC.BaseSiteHandler {
 
     return videos;
   }
-
-  /**
-   * Handle YouTube-specific player state changes
-   * @param {HTMLMediaElement} video - Video element
-   */
-  onPlayerStateChange(_video) {
-    // YouTube fires custom events we could listen to
-    // This could be used for better integration with YouTube's player
-    window.VSC.logger.debug('YouTube player state changed');
-  }
 }
+
+YouTubeHandler.CLASSIFIER_RULES = Object.freeze({ pointerHoldArms: true, spacebarArms: true });
 
 // Create singleton instance
 window.VSC.YouTubeHandler = YouTubeHandler;

@@ -2,7 +2,7 @@
 
 /**
  * E2E test runner for Video Speed Controller Chrome Extension
- * Usage: node tests/e2e/run-e2e.js [youtube|basic|all]
+ * Usage: node tests/e2e/run-e2e.js [youtube|basic|settings|display|arbitration|lifecycle|all]
  */
 
 import { pathToFileURL, fileURLToPath } from 'url';
@@ -15,7 +15,7 @@ const __dirname = dirname(__filename);
 // Check if Puppeteer is available
 try {
   await import('puppeteer');
-} catch (error) {
+} catch {
   console.error('❌ Puppeteer not found. Install it with: npm install puppeteer');
   console.error('   Note: Puppeteer will download a Chrome binary (~170MB)');
   process.exit(1);
@@ -29,7 +29,7 @@ async function runE2ETests() {
 
   // Determine which tests to run based on command line argument
   const testType = process.argv[2];
-  let testFiles = [];
+  let testFiles;
 
   if (testType === 'youtube') {
     testFiles = ['youtube.e2e.js'];
@@ -39,6 +39,10 @@ async function runE2ETests() {
     testFiles = ['settings-injection.e2e.js'];
   } else if (testType === 'display') {
     testFiles = ['display-toggle.e2e.js'];
+  } else if (testType === 'arbitration') {
+    testFiles = ['speed-arbitration.e2e.js'];
+  } else if (testType === 'lifecycle') {
+    testFiles = ['lifecycle.e2e.js'];
   } else {
     // Run all tests
     testFiles = [
@@ -46,6 +50,8 @@ async function runE2ETests() {
       'youtube.e2e.js',
       'settings-injection.e2e.js',
       'display-toggle.e2e.js',
+      'speed-arbitration.e2e.js',
+      'lifecycle.e2e.js',
     ];
   }
 

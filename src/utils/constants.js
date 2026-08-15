@@ -5,16 +5,20 @@
 // Keyboard identity maps — shared with background.js (service worker context).
 // esbuild inlines these into each bundle at build time.
 import {
-  PREDEFINED_CODE_MAP, KEYCODE_TO_CODE, displayKeyFromCode,
-  PREDEFINED_ACTIONS, BLACKLISTED_CODES, DEFAULT_BINDINGS,
+  PREDEFINED_CODE_MAP,
+  KEYCODE_TO_CODE,
+  displayKeyFromCode,
+  PREDEFINED_ACTIONS,
+  BLACKLISTED_CODES,
+  DEFAULT_BINDINGS,
 } from './key-maps.js';
 import { DEFAULT_CONTROLLER_CSS } from '../styles/controller-css-defaults.js';
 
 window.VSC = window.VSC || {};
+
 window.VSC.Constants = {};
 
 if (!window.VSC.Constants.DEFAULT_SETTINGS) {
-
   // Define constants directly first for ES6 exports
   const regStrip = /^[\r\t\f\v ]+|[\r\t\f\v ]+$/gm;
   const regEndsWithFlags = /\/(?!.*(.).*\1)[gimsuy]*$/;
@@ -35,13 +39,18 @@ if (!window.VSC.Constants.DEFAULT_SETTINGS) {
     startHidden: false, // default: false
     controllerOpacity: 0.3, // default: 0.3
     controllerButtonSize: 14,
-    controllerCSS: DEFAULT_CONTROLLER_CSS,
-    keyBindings: PREDEFINED_ACTIONS.map(action => ({
-      action, ...DEFAULT_BINDINGS[action], predefined: true,
+    customCSS: '', // user's additional CSS injected alongside the built-in defaults
+    keyBindings: PREDEFINED_ACTIONS.map((action) => ({
+      action,
+      ...DEFAULT_BINDINGS[action],
+      predefined: true,
     })),
-    blacklist: `www.instagram.com
-x.com
-imgur.com
+    siteRules: [
+      { pattern: 'imgur.com', enabled: false, speed: null },
+      { pattern: 'teams.microsoft.com', enabled: false, speed: null },
+      { pattern: 'meet.google.com', enabled: false, speed: null },
+    ],
+    blacklist: `imgur.com
 teams.microsoft.com
 meet.google.com`.replace(regStrip, ''),
     defaultLogLevel: 4,
@@ -74,7 +83,6 @@ meet.google.com`.replace(regStrip, ''),
     RESET_SPEED: 'VSC_RESET_SPEED',
     TOGGLE_DISPLAY: 'VSC_TOGGLE_DISPLAY',
     TEARDOWN: 'VSC_TEARDOWN',
-    REINIT: 'VSC_REINIT',
   };
 
   const SPEED_LIMITS = {

@@ -12,13 +12,11 @@ if (!window.VSC.VideoSpeedConfig) {
       this.saveTimer = null;
       this.SAVE_DELAY = 1000; // 1 second
       this._loaded = false;
-      // Tracks the last speed value we wrote to storage, so the onChanged
-      // listener can distinguish our own echo from a genuine external write.
-      this._lastWrittenSpeed = null;
 
-      // Keep in-memory settings fresh when other contexts write to storage.
-      // This prevents the stale-read problem where e.g. the options page holds
-      // an old lastSpeed while the content script has already updated it.
+      // Keep in-memory settings fresh when other contexts write to storage
+      // (options-page changes — key bindings, visibility, opacity — reach
+      // running content scripts live). lastSpeed is deliberately excluded:
+      // see the session-isolation note in the listener.
       this._setupStorageListener();
     }
 
@@ -30,27 +28,25 @@ if (!window.VSC.VideoSpeedConfig) {
       try {
         window.VSC.StorageManager.onChanged((changes) => {
           for (const [key, change] of Object.entries(changes)) {
-            if (!(key in this.settings) || change.newValue === undefined) continue;
+            if (!(key in this.settings) || change.newValue === undefined) {
+              continue;
+            }
 
-            // Self-echo guard: skip our own debounced speed write echoing back.
-            // Without this, the echo reverts in-memory state and mis-cancels timers.
+            // Session isolation (#1559, docs/speed-arbitration.md "Design
+            // note: multi-tab authority"): lastSpeed is SESSION authority
+            // and is never adopted from another context mid-session — each
+            // tab's arbiter runs on its own authority, and storage is a
+            // last-writer-wins register consulted only at load(). Adopting
+            // it here would mutate `desired` through a channel outside the
+            // verified event alphabet, and it is how tabs bled speeds into
+            // each other. Skipping it also absorbs our own debounced write
+            // echoing back (chrome fires onChanged in the writing context
+            // too), which a self-echo token previously had to detect.
             if (key === 'lastSpeed') {
-              const isSelfEcho = this._lastWrittenSpeed !== null
-                  && change.newValue === this._lastWrittenSpeed;
-              this._lastWrittenSpeed = null; // always clear — stale token is worse than missing one
-              if (isSelfEcho) continue;
+              continue;
             }
 
             this.settings[key] = change.newValue;
-
-            // External lastSpeed write while we have a pending debounce:
-            // cancel our stale timer — the external value is more recent.
-            if (key === 'lastSpeed' && this.saveTimer) {
-              clearTimeout(this.saveTimer);
-              this.saveTimer = null;
-              this.pendingSave = null;
-            }
-
             window.VSC.logger.debug(`Settings updated from storage change: ${key}`);
           }
         });
@@ -67,16 +63,25 @@ if (!window.VSC.VideoSpeedConfig) {
      */
     async load() {
       try {
-        // Use StorageManager which handles both contexts automatically
-        const storage = await window.VSC.StorageManager.get(window.VSC.Constants.DEFAULT_SETTINGS);
-        // Storage read complete — save() is now safe (we have real data, not defaults).
-        // Set before keyBindings init below, which calls save() internally.
+        // Use StorageManager which handles both contexts automatically.
+        // controllerCSS: null fetches the legacy key for one-time migration (not in DEFAULT_SETTINGS).
+        const storage = await window.VSC.StorageManager.get({
+          ...window.VSC.Constants.DEFAULT_SETTINGS,
+          controllerCSS: null,
+        });
+
+        // null = bridge signaled abort (site disabled/blacklisted)
+        if (storage === null) {
+          this.settings._abort = true;
+          return;
+        }
+
         this._loaded = true;
 
         // Handle key bindings migration/initialization
-        this.settings.keyBindings =
-          (storage.keyBindings || window.VSC.Constants.DEFAULT_SETTINGS.keyBindings)
-            .map(VideoSpeedConfig.normalizeKeyBinding);
+        this.settings.keyBindings = (
+          storage.keyBindings || window.VSC.Constants.DEFAULT_SETTINGS.keyBindings
+        ).map(VideoSpeedConfig.normalizeKeyBinding);
 
         if (!storage.keyBindings || storage.keyBindings.length === 0) {
           window.VSC.logger.info('First initialization - setting up default key bindings');
@@ -84,15 +89,85 @@ if (!window.VSC.VideoSpeedConfig) {
           await this.save({ keyBindings: this.settings.keyBindings });
         }
 
+        // Migrate legacy blacklist → siteRules (one-shot)
+        if (storage.blacklist !== null && storage.blacklist !== undefined && !storage.siteRules) {
+          const regStrip = /^[\r\t\f\v ]+|[\r\t\f\v ]+$/gm;
+          storage.siteRules = storage.blacklist
+            .split('\n')
+            .map((l) => l.replace(regStrip, ''))
+            .filter(Boolean)
+            .map((pattern) => ({ pattern, enabled: false, speed: null }));
+          await this.save({ siteRules: storage.siteRules });
+          // Keep blacklist in storage for backward compat with older extension
+          // versions that may be synced across devices. Harmless dead weight.
+          window.VSC.logger.info('Migrated blacklist to siteRules');
+        } else if (
+          storage.blacklist !== null &&
+          storage.blacklist !== undefined &&
+          storage.siteRules
+        ) {
+          // Both exist — this is the normal state for all migrated users.
+          // blacklist is intentionally kept in storage for sync compat with older
+          // extension versions on other devices (see bridge fix: blacklist is only
+          // checked pre-migration when siteRules is absent).
+          // TODO: remove blacklist from storage once we're confident sync compat
+          // is no longer needed (a few release cycles after siteRules shipped).
+        }
+
+        // Apply siteRules
+        this.settings.siteRules =
+          storage.siteRules || window.VSC.Constants.DEFAULT_SETTINGS.siteRules;
+
+        // Match current URL against site rules to derive per-site default speed.
+        // Reset first: without this, siteDefaultSpeed is sticky across load()
+        // calls — invisible in production (fresh process per page load) but a
+        // real leak in any long-lived context, and load() below would null
+        // lastSpeed based on a stale rule.
+        // matchSiteRule is exposed on window.VSC by inject-entry.js; guard for
+        // test environments where it may not be available.
+        this.settings.siteDefaultSpeed = null;
+        if (window.VSC.matchSiteRule) {
+          const matched = window.VSC.matchSiteRule(this.settings.siteRules, window.location.href);
+          if (matched && matched.speed !== null && matched.speed !== undefined) {
+            this.settings.siteDefaultSpeed = matched.speed;
+            window.VSC.logger.info(
+              `Site rule matched: pattern="${matched.pattern}", speed=${matched.speed}`
+            );
+          }
+        }
+
         // Apply loaded settings
-        this.settings.lastSpeed = Number(storage.lastSpeed);
         this.settings.rememberSpeed = Boolean(storage.rememberSpeed);
+
+        // lastSpeed = the arbitration authority. null means "VSC has no
+        // opinion this session" — the arbiter then leaves the rate alone.
+        //
+        // Priority on fresh load (LOAD in docs/speed-arbitration.md):
+        //   1. siteDefaultSpeed (per-site rule) — becomes INITIAL authority
+        //   2. lastSpeed from storage (rememberSpeed=true, no per-site rule)
+        //   3. null → no opinion
+        //
+        // A rule seeds lastSpeed rather than nulling it (F5 fix): the rule
+        // is an initial value of the same authority the user can later
+        // override, fight-back protects it, and lifecycle re-asserts it —
+        // one uniform machine instead of a special rule mode.
+        if (this.settings.siteDefaultSpeed) {
+          this.settings.lastSpeed = this.settings.siteDefaultSpeed;
+        } else if (this.settings.rememberSpeed) {
+          this.settings.lastSpeed = Number(storage.lastSpeed) || null;
+        } else {
+          this.settings.lastSpeed = null;
+        }
         this.settings.exclusiveKeys = Boolean(storage.exclusiveKeys);
         this.settings.audioBoolean = Boolean(storage.audioBoolean);
         this.settings.startHidden = Boolean(storage.startHidden);
         this.settings.controllerOpacity = Number(storage.controllerOpacity);
         this.settings.controllerButtonSize = Number(storage.controllerButtonSize);
-        this.settings.controllerCSS = storage.controllerCSS ?? window.VSC.Constants.DEFAULT_CONTROLLER_CSS;
+        // One-time migration: drop legacy controllerCSS key, reset to new model.
+        if (storage.controllerCSS !== null) {
+          window.VSC.StorageManager.remove(['controllerCSS']);
+        }
+        this.settings.customCSS = storage.customCSS ?? '';
         this.settings.logLevel = Number(
           storage.logLevel || window.VSC.Constants.DEFAULT_SETTINGS.logLevel
         );
@@ -127,15 +202,34 @@ if (!window.VSC.VideoSpeedConfig) {
      * @param {Object} newSettings - Settings to save (only these keys are written)
      * @returns {Promise<boolean>} true if persisted (or debounced), false on storage failure
      */
+    /**
+     * Commit a speed as the SESSION authority (in-memory lastSpeed) and
+     * persist it when the user asked us to remember speed. Executes the
+     * arbiter's PERSIST effect (cells 2/5/7/12). Persistence purity (I2)
+     * holds by construction: only user-attributed choices reach this —
+     * lifecycle, fight and observe paths never call it.
+     * @param {number} speed
+     */
+    persistAuthority(speed) {
+      this.settings.lastSpeed = speed;
+      if (this.settings.rememberSpeed) {
+        this.save({ lastSpeed: speed });
+      }
+    }
+
     async save(newSettings = {}) {
       const keys = Object.keys(newSettings);
-      if (keys.length === 0) return true;
+      if (keys.length === 0) {
+        return true;
+      }
 
       // Guard: refuse to write before load() has read from storage.
       // Without this, a save() during initialization writes DEFAULT_SETTINGS
       // to storage, silently clobbering the user's real persisted values.
       if (!this._loaded) {
-        window.VSC.logger.error('save() called before load() — refusing to overwrite user data with defaults');
+        window.VSC.logger.error(
+          'save() called before load() — refusing to overwrite user data with defaults'
+        );
         return false;
       }
 
@@ -155,12 +249,10 @@ if (!window.VSC.VideoSpeedConfig) {
           this.pendingSave = null;
           this.saveTimer = null;
 
-          this._lastWrittenSpeed = speedToSave;
           try {
             await window.VSC.StorageManager.set({ lastSpeed: speedToSave });
             window.VSC.logger.info('Debounced speed setting saved successfully');
           } catch (error) {
-            this._lastWrittenSpeed = null;
             window.VSC.logger.error(`Failed to persist speed: ${error.message}`);
           }
         }, this.SAVE_DELAY);
@@ -236,7 +328,9 @@ if (!window.VSC.VideoSpeedConfig) {
      * @private
      */
     static normalizeKeyBinding(binding) {
-      if (!binding || !binding.modifiers) return binding;
+      if (!binding || !binding.modifiers) {
+        return binding;
+      }
       const m = binding.modifiers;
       const normalized = {
         shift: Boolean(m.shift),
@@ -252,7 +346,6 @@ if (!window.VSC.VideoSpeedConfig) {
       }
       return result;
     }
-
   }
 
   // Create singleton instance

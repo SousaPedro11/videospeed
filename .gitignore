@@ -1,12 +1,22 @@
 .DS_Store
-.cursor
-.claude
-.agent
 .idea
-.AGENT.md
-CLAUDE*.md
+
+# Harness
+.pi
+.claude
+.cursor
+.agent
 local
+AGENTS*.md
+
+# Build artifacts
 dist
+release
 tests/e2e/screenshots
 node_modules
-plan.md
+coverage
+
+# TLC model-checker artifacts (specs/)
+specs/states/
+specs/*_TTrace_*.tla
+specs/*_TTrace_*.bin

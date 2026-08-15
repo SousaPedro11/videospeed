@@ -20,13 +20,12 @@ class VideoMutationObserver {
    */
   start(document) {
     this.observer = new MutationObserver((mutations) => {
-      // Process DOM nodes with reasonable delay
-      requestIdleCallback(
-        () => {
-          this.processMutations(mutations);
-        },
-        { timeout: 2000 }
-      );
+      // Process mutations when the browser is genuinely idle — no forced timeout.
+      // Sites do async post-load init that's sensitive to DOM insertions; a
+      // forced timeout can fire during that window.
+      requestIdleCallback(() => {
+        this.processMutations(mutations);
+      });
     });
 
     const observerOptions = {
@@ -199,9 +198,10 @@ class VideoMutationObserver {
       if (added) {
         this.onVideoFound(node, parent);
       } else {
-        if (node.vsc) {
-          this.onVideoRemoved(node);
-        }
+        // Removal also retires a deferred loadeddata listener for media that
+        // was discovered before it was ready, so this callback must run even
+        // before a VideoController has been attached.
+        this.onVideoRemoved(node);
       }
     } else {
       this.processNodeChildren(node, parent, added);
